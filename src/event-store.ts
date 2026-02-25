@@ -16,27 +16,6 @@ import { randomUUID } from "crypto"
 import path from "path"
 
 // ---------------------------------------------------------------------------
-// Types -- store events (the immutable log entries)
-// ---------------------------------------------------------------------------
-
-export type StoreEventType =
-  // schedule lifecycle
-  | "schedule.created"
-  | "schedule.cancelled"
-  | "schedule.executed"
-  | "schedule.failed"
-  | "schedule.expired"
-  // project event bus
-  | "bus.emitted"
-
-export interface StoreEvent {
-  id: string
-  type: StoreEventType
-  timestamp: string
-  payload: Record<string, unknown>
-}
-
-// ---------------------------------------------------------------------------
 // Types -- trigger
 // ---------------------------------------------------------------------------
 
@@ -55,6 +34,98 @@ export interface EventTrigger {
 }
 
 export type Trigger = TimeTrigger | EventTrigger
+
+// ---------------------------------------------------------------------------
+// Types -- store events (discriminated union with typed payloads)
+// ---------------------------------------------------------------------------
+
+interface ScheduleCreatedEvent {
+  id: string
+  type: "schedule.created"
+  timestamp: string
+  payload: {
+    scheduleId: string
+    sessionId: string
+    command: string
+    arguments: string
+    trigger: Trigger
+    reason: string
+    createdBy: string
+  }
+}
+
+interface ScheduleCancelledEvent {
+  id: string
+  type: "schedule.cancelled"
+  timestamp: string
+  payload: {
+    scheduleId: string
+    reason: string
+  }
+}
+
+interface ScheduleExecutedEvent {
+  id: string
+  type: "schedule.executed"
+  timestamp: string
+  payload: {
+    scheduleId: string
+    result: string
+    triggeredByEvent?: string
+    actualSessionId?: string
+  }
+}
+
+interface ScheduleFailedEvent {
+  id: string
+  type: "schedule.failed"
+  timestamp: string
+  payload: {
+    scheduleId: string
+    error: string
+    triggeredByEvent?: string
+  }
+}
+
+interface ScheduleExpiredEvent {
+  id: string
+  type: "schedule.expired"
+  timestamp: string
+  payload: {
+    scheduleId: string
+  }
+}
+
+interface BusEmittedEvent {
+  id: string
+  type: "bus.emitted"
+  timestamp: string
+  payload: {
+    eventId: string
+    kind: string
+    message: string
+    sessionId: string
+  }
+}
+
+export type StoreEvent =
+  | ScheduleCreatedEvent
+  | ScheduleCancelledEvent
+  | ScheduleExecutedEvent
+  | ScheduleFailedEvent
+  | ScheduleExpiredEvent
+  | BusEmittedEvent
+
+export type StoreEventType = StoreEvent["type"]
+
+/** Input type for append(): id and timestamp are generated automatically. */
+export type StoreEventInput =
+  | Omit<ScheduleCreatedEvent, "id" | "timestamp">
+  | Omit<ScheduleCancelledEvent, "id" | "timestamp">
+  | Omit<ScheduleExecutedEvent, "id" | "timestamp">
+  | Omit<ScheduleFailedEvent, "id" | "timestamp">
+  | Omit<ScheduleExpiredEvent, "id" | "timestamp">
+  | Omit<BusEmittedEvent, "id" | "timestamp">
 
 // ---------------------------------------------------------------------------
 // Types -- materialized schedule entry
@@ -121,15 +192,13 @@ export class EventStore {
   }
 
   /** Append a single event to the log. */
-  async append(
-    event: Omit<StoreEvent, "id" | "timestamp">,
-  ): Promise<StoreEvent> {
+  async append(event: StoreEventInput): Promise<StoreEvent> {
     await this.init()
-    const full: StoreEvent = {
+    const full = {
       id: generateId("evt"),
       timestamp: new Date().toISOString(),
       ...event,
-    }
+    } as StoreEvent
     await appendFile(this.eventsPath, JSON.stringify(full) + "\n")
     return full
   }
@@ -158,35 +227,41 @@ export class EventStore {
     const map = new Map<string, ScheduleEntry>()
 
     for (const evt of events) {
-      const sid = evt.payload.scheduleId as string | undefined
-      if (!sid) continue
-
       switch (evt.type) {
-        case "schedule.created": {
-          const triggerRaw = evt.payload.trigger as Trigger
-          map.set(sid, {
-            scheduleId: sid,
-            sessionId: evt.payload.sessionId as string,
-            command: evt.payload.command as string,
-            arguments: (evt.payload.arguments as string) ?? "",
-            trigger: triggerRaw,
+        case "schedule.created":
+          map.set(evt.payload.scheduleId, {
+            scheduleId: evt.payload.scheduleId,
+            sessionId: evt.payload.sessionId,
+            command: evt.payload.command,
+            arguments: evt.payload.arguments,
+            trigger: evt.payload.trigger,
             status: "pending",
-            reason: (evt.payload.reason as string) ?? undefined,
+            reason: evt.payload.reason || undefined,
             createdAt: evt.timestamp,
           })
           break
+        case "schedule.cancelled": {
+          const entry = map.get(evt.payload.scheduleId)
+          if (entry) entry.status = "cancelled"
+          break
         }
-        case "schedule.cancelled":
-          if (map.has(sid)) map.get(sid)!.status = "cancelled"
+        case "schedule.executed": {
+          const entry = map.get(evt.payload.scheduleId)
+          if (entry) entry.status = "executed"
           break
-        case "schedule.executed":
-          if (map.has(sid)) map.get(sid)!.status = "executed"
+        }
+        case "schedule.failed": {
+          const entry = map.get(evt.payload.scheduleId)
+          if (entry) entry.status = "failed"
           break
-        case "schedule.failed":
-          if (map.has(sid)) map.get(sid)!.status = "failed"
+        }
+        case "schedule.expired": {
+          const entry = map.get(evt.payload.scheduleId)
+          if (entry) entry.status = "expired"
           break
-        case "schedule.expired":
-          if (map.has(sid)) map.get(sid)!.status = "expired"
+        }
+        case "bus.emitted":
+          // Bus events don't affect schedule materialization
           break
       }
     }
@@ -208,15 +283,19 @@ export class EventStore {
   /** Replay all bus.emitted events into a list. */
   async busEvents(): Promise<BusEvent[]> {
     const events = await this.readAll()
-    return events
-      .filter((e) => e.type === "bus.emitted")
-      .map((e) => ({
-        eventId: e.id,
-        kind: e.payload.kind as string,
-        message: e.payload.message as string,
-        sessionId: e.payload.sessionId as string,
-        timestamp: e.timestamp,
-      }))
+    const busEvents: BusEvent[] = []
+    for (const e of events) {
+      if (e.type === "bus.emitted") {
+        busEvents.push({
+          eventId: e.payload.eventId,
+          kind: e.payload.kind,
+          message: e.payload.message,
+          sessionId: e.payload.sessionId,
+          timestamp: e.timestamp,
+        })
+      }
+    }
+    return busEvents
   }
 
   /** Find pending event-triggered schedules that match a given bus event kind. */

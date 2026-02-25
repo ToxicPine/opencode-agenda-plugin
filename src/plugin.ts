@@ -14,7 +14,7 @@
  */
 
 import type { Plugin } from "@opencode-ai/plugin"
-import { EventStore, type ScheduleEntry } from "./event-store.js"
+import { EventStore, type ScheduleEntry, type TimeTrigger, type EventTrigger } from "./event-store.js"
 import { createTools } from "./tools.js"
 import { DEFAULT_SAFETY, shouldFire, type SafetyConfig } from "./safety.js"
 
@@ -262,16 +262,23 @@ export const SchedulerPlugin: Plugin = async ({ client, directory }) => {
     "experimental.session.compacting": async (_input, output) => {
       const pending = await store.pending()
       if (pending.length > 0) {
-        const timeEntries = pending.filter((s) => s.trigger.type === "time")
-        const eventEntries = pending.filter((s) => s.trigger.type === "event")
-
         let ctx = `## Active Project Schedule\n\n`
+
+        const timeEntries = pending.filter(
+          (s): s is ScheduleEntry & { trigger: TimeTrigger } =>
+            s.trigger.type === "time",
+        )
+        const eventEntries = pending.filter(
+          (s): s is ScheduleEntry & { trigger: EventTrigger } =>
+            s.trigger.type === "event",
+        )
+
         if (timeEntries.length > 0) {
           ctx += `### Time-Triggered (${timeEntries.length})\n`
           ctx += timeEntries
             .map(
               (s) =>
-                `- [${s.scheduleId}] /${s.command} ${s.arguments} at ${(s.trigger as any).executeAt} session:${s.sessionId}` +
+                `- [${s.scheduleId}] /${s.command} ${s.arguments} at ${s.trigger.executeAt} session:${s.sessionId}` +
                 (s.reason ? ` -- ${s.reason}` : ""),
             )
             .join("\n")
@@ -282,7 +289,7 @@ export const SchedulerPlugin: Plugin = async ({ client, directory }) => {
           ctx += eventEntries
             .map(
               (s) =>
-                `- [${s.scheduleId}] /${s.command} ${s.arguments} on "${(s.trigger as any).eventKind}" session:${s.sessionId}` +
+                `- [${s.scheduleId}] /${s.command} ${s.arguments} on "${s.trigger.eventKind}" session:${s.sessionId}` +
                 (s.reason ? ` -- ${s.reason}` : ""),
             )
             .join("\n")

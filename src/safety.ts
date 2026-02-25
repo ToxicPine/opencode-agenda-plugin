@@ -119,22 +119,22 @@ export async function validateSchedule(
   const events = await store.readAll()
   const windowStart = Date.now() - config.doomLoopWindowMs
   const recentSchedules = events.filter(
-    (evt) =>
+    (evt): evt is Extract<typeof evt, { type: "schedule.created" }> =>
       evt.type === "schedule.created" &&
       new Date(evt.timestamp).getTime() > windowStart &&
       evt.payload.command === command &&
       evt.payload.arguments === args,
   )
   const recentExecutions = events.filter(
-    (evt) =>
+    (evt): evt is Extract<typeof evt, { type: "schedule.executed" }> =>
       evt.type === "schedule.executed" &&
       new Date(evt.timestamp).getTime() > windowStart,
   )
   const executedIds = new Set(
-    recentExecutions.map((e) => e.payload.scheduleId as string),
+    recentExecutions.map((e) => e.payload.scheduleId),
   )
   const unexecutedRecent = recentSchedules.filter(
-    (e) => !executedIds.has(e.payload.scheduleId as string),
+    (e) => !executedIds.has(e.payload.scheduleId),
   )
   if (unexecutedRecent.length >= config.doomLoopThreshold) {
     return {
@@ -158,7 +158,7 @@ export async function validateBusEmit(
   const events = await store.readAll()
   const hourAgo = Date.now() - 60 * 60 * 1000
   const recentEmits = events.filter(
-    (e) =>
+    (e): e is Extract<typeof e, { type: "bus.emitted" }> =>
       e.type === "bus.emitted" &&
       e.payload.sessionId === sessionId &&
       new Date(e.timestamp).getTime() > hourAgo,
