@@ -25,7 +25,6 @@ export type StoreEventType =
   | "schedule.cancelled"
   | "schedule.executed"
   | "schedule.failed"
-  | "schedule.rescheduled"
   | "schedule.expired"
   // project event bus
   | "bus.emitted"
@@ -189,35 +188,17 @@ export class EventStore {
         case "schedule.expired":
           if (map.has(sid)) map.get(sid)!.status = "expired"
           break
-        case "schedule.rescheduled":
-          if (map.has(sid)) {
-            const entry = map.get(sid)!
-            if (entry.trigger.type === "time") {
-              entry.trigger.executeAt = evt.payload.executeAt as string
-            }
-          }
-          break
       }
     }
     return [...map.values()]
   }
 
-  /** Return only entries that are still pending. */
-  async pending(): Promise<ScheduleEntry[]> {
+  /** Return entries that are still pending, optionally filtered by trigger type. */
+  async pending(byType?: Trigger["type"]): Promise<ScheduleEntry[]> {
     const all = await this.materialize()
-    return all.filter((e) => e.status === "pending")
-  }
-
-  /** Pending time-triggered entries. */
-  async pendingTimeTriggers(): Promise<ScheduleEntry[]> {
-    const p = await this.pending()
-    return p.filter((e) => e.trigger.type === "time")
-  }
-
-  /** Pending event-triggered entries. */
-  async pendingEventTriggers(): Promise<ScheduleEntry[]> {
-    const p = await this.pending()
-    return p.filter((e) => e.trigger.type === "event")
+    const p = all.filter((e) => e.status === "pending")
+    if (byType) return p.filter((e) => e.trigger.type === byType)
+    return p
   }
 
   // -----------------------------------------------------------------------
@@ -240,7 +221,7 @@ export class EventStore {
 
   /** Find pending event-triggered schedules that match a given bus event kind. */
   async matchingSchedules(kind: string): Promise<ScheduleEntry[]> {
-    const pending = await this.pendingEventTriggers()
+    const pending = await this.pending("event")
     return pending.filter(
       (e) => e.trigger.type === "event" && e.trigger.eventKind === kind,
     )

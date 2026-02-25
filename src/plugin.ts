@@ -4,7 +4,7 @@
  * Project-scoped: one scheduler per project directory. All sessions within
  * the project share the schedule and event bus.
  *
- * - Registers schedule/list/cancel/reschedule + bus_emit/bus_events tools
+ * - Registers schedule/list/cancel + bus_emit/bus_events tools
  * - Runs two polling loops:
  *     1. Time trigger loop: fires due time-based schedules
  *     2. Event match loop: checks for newly emitted bus events that match
@@ -89,7 +89,7 @@ export const SchedulerPlugin: Plugin = async ({ client, directory }) => {
     const fireCheck = shouldFire(safetyConfig)
     if (fireCheck) return
 
-    const pending = await store.pendingTimeTriggers()
+    const pending = await store.pending("time")
     const now = Date.now()
 
     for (const entry of pending) {
@@ -142,7 +142,7 @@ export const SchedulerPlugin: Plugin = async ({ client, directory }) => {
     const now = new Date()
 
     // 1. Expire stale event-triggered schedules
-    const pendingEvent = await store.pendingEventTriggers()
+    const pendingEvent = await store.pending("event")
     for (const entry of pendingEvent) {
       if (
         entry.trigger.type === "event" &&
@@ -226,7 +226,6 @@ export const SchedulerPlugin: Plugin = async ({ client, directory }) => {
       schedule: tools.schedule,
       schedule_list: tools.list,
       schedule_cancel: tools.cancel,
-      schedule_reschedule: tools.reschedule,
       bus_emit: tools.busEmit,
       bus_events: tools.busEvents,
     },
@@ -247,14 +246,6 @@ export const SchedulerPlugin: Plugin = async ({ client, directory }) => {
           "Schedule Cancelled",
           String(output.result),
           "warning",
-        )
-      }
-      if (input.tool === "schedule_reschedule") {
-        await toast(
-          client,
-          "Schedule Rescheduled",
-          String(output.result),
-          "info",
         )
       }
       if (input.tool === "bus_emit") {

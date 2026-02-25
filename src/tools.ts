@@ -8,8 +8,7 @@
  * Tool surface:
  *   schedule          -- create a schedule (time or event triggered)
  *   schedule_list     -- view schedules across the project
- *   schedule_cancel   -- cancel a pending schedule
- *   schedule_reschedule -- change execution time (time-triggered only)
+ *   schedule_cancel   -- cancel a pending schedule (to reschedule, cancel + create new)
  *   bus_emit          -- emit a project event (may trigger event-based schedules)
  *   bus_events        -- list recent project bus events
  */
@@ -245,46 +244,6 @@ export function createTools(store: EventStore, safetyConfig: SafetyConfig) {
   })
 
   // -----------------------------------------------------------------------
-  // schedule_reschedule
-  // -----------------------------------------------------------------------
-  const reschedule = tool({
-    description:
-      "Change the execution time of a pending time-triggered schedule.",
-    args: {
-      scheduleId: tool.schema
-        .string()
-        .describe("The schedule ID to reschedule"),
-      newExecuteAt: tool.schema
-        .string()
-        .describe("New ISO 8601 execution time"),
-      reason: tool.schema
-        .string()
-        .optional()
-        .describe("Why this is being rescheduled"),
-    },
-    async execute(args) {
-      const entries = await store.materialize()
-      const entry = entries.find((e) => e.scheduleId === args.scheduleId)
-      if (!entry) return `Schedule ${args.scheduleId} not found.`
-      if (entry.status !== "pending")
-        return `Schedule ${args.scheduleId} is already ${entry.status}, cannot reschedule.`
-      if (entry.trigger.type !== "time")
-        return `Schedule ${args.scheduleId} is event-triggered. Cancel and re-create instead.`
-
-      await store.append({
-        type: "schedule.rescheduled",
-        payload: {
-          scheduleId: args.scheduleId,
-          executeAt: args.newExecuteAt,
-          reason: args.reason ?? "",
-        },
-      })
-
-      return `Rescheduled ${args.scheduleId} to ${args.newExecuteAt}`
-    },
-  })
-
-  // -----------------------------------------------------------------------
   // bus_emit
   // -----------------------------------------------------------------------
   const busEmit = tool({
@@ -377,5 +336,5 @@ export function createTools(store: EventStore, safetyConfig: SafetyConfig) {
     },
   })
 
-  return { schedule, list, cancel, reschedule, busEmit, busEvents }
+  return { schedule, list, cancel, busEmit, busEvents }
 }
