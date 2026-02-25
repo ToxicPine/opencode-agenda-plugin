@@ -1,0 +1,4 @@
+node_modules/
+dist/
+*.jsonl
+.opencode/scheduler/events.jsonl

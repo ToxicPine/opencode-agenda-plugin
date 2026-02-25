@@ -1,0 +1,17 @@
+{
+  "name": "opencode-scheduler-plugin",
+  "version": "0.1.0",
+  "description": "Event-sourced scheduled command execution plugin for OpenCode",
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": "^1.2.12"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0"
+  },
+  "license": "MIT"
+}
