@@ -1,15 +1,12 @@
 /**
  * Tools exposed to the LLM.
  *
- * Tool surface:
- *   schedule        -- create a schedule (trigger + action)
- *   schedule_list   -- view schedules across the project
- *   schedule_cancel -- cancel a pending schedule
- *   bus_emit        -- emit a project bus event
- *   bus_events      -- list recent bus events
+ * All tools are prefixed agenda_ to avoid namespace collisions.
  */
 
 import { tool } from "@opencode-ai/plugin"
+import { writeFile, mkdir } from "fs/promises"
+import path from "path"
 import {
   EventStore,
   generateId,
@@ -17,25 +14,31 @@ import {
   type Action,
 } from "./event-store.js"
 import {
-  validateSchedule,
+  validateCreate,
   validateBusEmit,
   type SafetyConfig,
 } from "./safety.js"
 
-export function createTools(store: EventStore, safetyConfig: SafetyConfig) {
+export function createTools(store: EventStore, safetyConfig: SafetyConfig, projectRoot: string) {
+  const configPath = path.join(projectRoot, ".opencode", "agenda", "config.json")
+
+  const persistPauseState = async (paused: boolean): Promise<void> => {
+    await mkdir(path.dirname(configPath), { recursive: true })
+    await writeFile(configPath, JSON.stringify({ paused }, null, 2) + "\n")
+  }
+
   // -----------------------------------------------------------------------
-  // schedule
+  // agenda_create
   // -----------------------------------------------------------------------
-  const schedule = tool({
+  const create = tool({
     description:
-      "Create a schedule: a trigger paired with an action. " +
+      "Create an agenda item: a trigger paired with an action. " +
       "Triggers: 'time' (wall-clock) or 'event' (bus event, with any/all convergence). " +
       "Actions: 'command' (invoke a slash command in a session), " +
       "'emit' (emit a bus event, zero LLM cost), " +
-      "'cancel' (cancel another schedule, zero LLM cost), " +
-      "'schedule' (create a new schedule, zero LLM cost).",
+      "'cancel' (cancel another agenda item, zero LLM cost), " +
+      "'schedule' (create a new agenda item, zero LLM cost).",
     args: {
-      // -- trigger --
       triggerType: tool.schema
         .enum(["time", "event"])
         .describe("Trigger type"),
@@ -59,11 +62,9 @@ export function createTools(store: EventStore, safetyConfig: SafetyConfig) {
         .string()
         .optional()
         .describe("ISO 8601 expiry for event triggers (optional)"),
-      // -- action --
       actionType: tool.schema
         .enum(["command", "emit", "cancel", "schedule"])
         .describe("Action type to execute when trigger fires"),
-      // command action fields
       command: tool.schema
         .string()
         .optional()
@@ -76,7 +77,6 @@ export function createTools(store: EventStore, safetyConfig: SafetyConfig) {
         .string()
         .optional()
         .describe("Session ID, or 'new' (for actionType='command'). Omit for current session."),
-      // emit action fields
       emitKind: tool.schema
         .string()
         .optional()
@@ -85,16 +85,14 @@ export function createTools(store: EventStore, safetyConfig: SafetyConfig) {
         .string()
         .optional()
         .describe("Event message (for actionType='emit')"),
-      // cancel action fields
-      cancelScheduleId: tool.schema
+      cancelAgendaId: tool.schema
         .string()
         .optional()
-        .describe("Schedule ID to cancel (for actionType='cancel')"),
+        .describe("Agenda item ID to cancel (for actionType='cancel')"),
       cancelReason: tool.schema
         .string()
         .optional()
         .describe("Reason for cancellation (for actionType='cancel')"),
-      // schedule action fields (nested)
       nestedAction: tool.schema
         .string()
         .optional()
@@ -106,12 +104,11 @@ export function createTools(store: EventStore, safetyConfig: SafetyConfig) {
       nestedReason: tool.schema
         .string()
         .optional()
-        .describe("Reason for nested schedule (for actionType='schedule')"),
-      // -- metadata --
+        .describe("Reason for nested agenda item (for actionType='schedule')"),
       reason: tool.schema
         .string()
         .optional()
-        .describe("Why this schedule is being created"),
+        .describe("Why this agenda item is being created"),
     },
     async execute(args, context) {
       // Build trigger
@@ -149,11 +146,11 @@ export function createTools(store: EventStore, safetyConfig: SafetyConfig) {
           action = { type: "emit", kind: args.emitKind, message: args.emitMessage }
           break
         case "cancel":
-          if (!args.cancelScheduleId)
-            return "ERROR: cancelScheduleId required for cancel action."
+          if (!args.cancelAgendaId)
+            return "ERROR: cancelAgendaId required for cancel action."
           action = {
             type: "cancel",
-            scheduleId: args.cancelScheduleId,
+            scheduleId: args.cancelAgendaId,
             reason: args.cancelReason ?? "",
           }
           break
@@ -174,14 +171,14 @@ export function createTools(store: EventStore, safetyConfig: SafetyConfig) {
       }
 
       // Safety
-      const violation = await validateSchedule(store, action, trigger, safetyConfig)
+      const violation = validateCreate(store, action, trigger, safetyConfig)
       if (violation) return `BLOCKED [${violation.rule}]: ${violation.message}`
 
-      const scheduleId = generateId("sch")
+      const agendaId = generateId("agn")
       await store.append({
-        type: "schedule.created",
+        type: "agenda.created",
         payload: {
-          scheduleId,
+          agendaId,
           trigger,
           action,
           reason: args.reason ?? "",
@@ -189,7 +186,6 @@ export function createTools(store: EventStore, safetyConfig: SafetyConfig) {
         },
       })
 
-      // Format response
       const actionLabel =
         action.type === "command"
           ? `/${action.command} ${action.arguments}`.trimEnd() +
@@ -215,15 +211,15 @@ export function createTools(store: EventStore, safetyConfig: SafetyConfig) {
           (trigger.expiresAt ? ` expires ${trigger.expiresAt}` : "")
       }
 
-      return `Scheduled: ${actionLabel} ${triggerLabel}\nSchedule ID: ${scheduleId}`
+      return `Created: ${actionLabel} ${triggerLabel}\nAgenda ID: ${agendaId}`
     },
   })
 
   // -----------------------------------------------------------------------
-  // schedule_list
+  // agenda_list
   // -----------------------------------------------------------------------
   const list = tool({
-    description: "List all schedules in this project.",
+    description: "List all agenda items in this project.",
     args: {
       statusFilter: tool.schema.string().optional()
         .describe("Filter: pending, executed, cancelled, failed, expired"),
@@ -233,7 +229,7 @@ export function createTools(store: EventStore, safetyConfig: SafetyConfig) {
         .describe("Filter: command, emit, cancel, schedule"),
     },
     async execute(args) {
-      let entries = await store.materialize()
+      let entries = store.entries()
       if (args.statusFilter)
         entries = entries.filter((e) => e.status === args.statusFilter)
       if (args.triggerTypeFilter)
@@ -241,12 +237,11 @@ export function createTools(store: EventStore, safetyConfig: SafetyConfig) {
       if (args.actionTypeFilter)
         entries = entries.filter((e) => e.action.type === args.actionTypeFilter)
 
-      if (entries.length === 0) return "No schedules found."
+      if (entries.length === 0) return "No agenda items found."
 
       const now = Date.now()
       return entries
         .map((e) => {
-          // Trigger label
           let trig: string
           if (e.trigger.type === "time") {
             const d = new Date(e.trigger.executeAt).getTime() - now
@@ -260,18 +255,18 @@ export function createTools(store: EventStore, safetyConfig: SafetyConfig) {
             if (e.trigger.expiresAt) trig += ` exp:${e.trigger.expiresAt}`
           }
 
-          // Action label
           let act: string
           switch (e.action.type) {
             case "command":
-              act = `/${e.action.command} ${e.action.arguments}`.trimEnd() + ` sess:${e.action.sessionId === "new" ? "new" : e.action.sessionId.slice(0, 8)}`
+              act = `/${e.action.command} ${e.action.arguments}`.trimEnd() +
+                ` sess:${e.action.sessionId === "new" ? "new" : e.action.sessionId.slice(0, 8)}`
               break
             case "emit": act = `emit "${e.action.kind}"`; break
             case "cancel": act = `cancel ${e.action.scheduleId}`; break
             case "schedule": act = `schedule (nested)`; break
           }
 
-          return `[${e.scheduleId}] ${act}  ${trig}  [${e.status}]` +
+          return `[${e.agendaId}] ${act}  ${trig}  [${e.status}]` +
             (e.reason ? `  -- ${e.reason}` : "")
         })
         .join("\n")
@@ -279,41 +274,40 @@ export function createTools(store: EventStore, safetyConfig: SafetyConfig) {
   })
 
   // -----------------------------------------------------------------------
-  // schedule_cancel
+  // agenda_cancel
   // -----------------------------------------------------------------------
   const cancel = tool({
-    description: "Cancel a pending schedule by ID.",
+    description: "Cancel a pending agenda item by ID.",
     args: {
-      scheduleId: tool.schema.string().describe("Schedule ID to cancel"),
+      agendaId: tool.schema.string().describe("Agenda item ID to cancel"),
       reason: tool.schema.string().optional().describe("Why"),
     },
     async execute(args) {
-      const entries = await store.materialize()
-      const entry = entries.find((e) => e.scheduleId === args.scheduleId)
-      if (!entry) return `Schedule ${args.scheduleId} not found.`
+      const entry = store.entries().find((e) => e.agendaId === args.agendaId)
+      if (!entry) return `Agenda item ${args.agendaId} not found.`
       if (entry.status !== "pending")
-        return `Schedule ${args.scheduleId} is ${entry.status}, cannot cancel.`
+        return `Agenda item ${args.agendaId} is ${entry.status}, cannot cancel.`
 
       await store.append({
-        type: "schedule.cancelled",
-        payload: { scheduleId: args.scheduleId, reason: args.reason ?? "" },
+        type: "agenda.cancelled",
+        payload: { agendaId: args.agendaId, reason: args.reason ?? "" },
       })
 
-      return `Cancelled ${args.scheduleId}`
+      return `Cancelled ${args.agendaId}`
     },
   })
 
   // -----------------------------------------------------------------------
-  // bus_emit
+  // agenda_emit
   // -----------------------------------------------------------------------
-  const busEmit = tool({
-    description: "Emit a project bus event. Matching event-triggered schedules will fire.",
+  const emit = tool({
+    description: "Emit a project bus event. Matching event-triggered agenda items will fire.",
     args: {
       kind: tool.schema.string().describe("Event kind"),
       message: tool.schema.string().describe("Human-readable message"),
     },
     async execute(args, context) {
-      const violation = await validateBusEmit(store, context.sessionID, safetyConfig)
+      const violation = validateBusEmit(store, context.sessionID, safetyConfig)
       if (violation) return `BLOCKED [${violation.rule}]: ${violation.message}`
 
       await store.append({
@@ -326,36 +320,62 @@ export function createTools(store: EventStore, safetyConfig: SafetyConfig) {
         },
       })
 
-      const matching = await store.matchingSchedules(args.kind)
+      const matching = store.matchingEntries(args.kind)
       return (
         `Emitted "${args.kind}": ${args.message}\n` +
         (matching.length > 0
-          ? `${matching.length} schedule(s) will fire.`
-          : `No schedules listening.`)
+          ? `${matching.length} agenda item(s) will fire.`
+          : `No agenda items listening.`)
       )
     },
   })
 
   // -----------------------------------------------------------------------
-  // bus_events
+  // agenda_events
   // -----------------------------------------------------------------------
-  const busEvents = tool({
+  const events = tool({
     description: "List recent project bus events.",
     args: {
       limit: tool.schema.number().optional().describe("Max events (default 20)"),
       kindFilter: tool.schema.string().optional().describe("Filter by kind"),
     },
     async execute(args) {
-      let events = await store.busEvents()
-      if (args.kindFilter) events = events.filter((e) => e.kind === args.kindFilter)
-      events.reverse()
-      events = events.slice(0, args.limit ?? 20)
-      if (events.length === 0) return "No bus events found."
-      return events
+      let busEvents = store.busEvents()
+      if (args.kindFilter) busEvents = busEvents.filter((e) => e.kind === args.kindFilter)
+      busEvents.reverse()
+      busEvents = busEvents.slice(0, args.limit ?? 20)
+      if (busEvents.length === 0) return "No bus events found."
+      return busEvents
         .map((e) => `[${e.eventId}] "${e.kind}" -- ${e.message}  (${e.timestamp})`)
         .join("\n")
     },
   })
 
-  return { schedule, list, cancel, busEmit, busEvents }
+  // -----------------------------------------------------------------------
+  // agenda_pause
+  // -----------------------------------------------------------------------
+  const pause = tool({
+    description: "Pause the agenda. Pending items remain queued but will not fire until resumed.",
+    args: {},
+    async execute() {
+      safetyConfig.paused = true
+      await persistPauseState(true)
+      return "Agenda paused. Pending items will not fire until resumed."
+    },
+  })
+
+  // -----------------------------------------------------------------------
+  // agenda_resume
+  // -----------------------------------------------------------------------
+  const resume = tool({
+    description: "Resume the agenda. Pending items will begin firing again.",
+    args: {},
+    async execute() {
+      safetyConfig.paused = false
+      await persistPauseState(false)
+      return "Agenda resumed. Pending items will fire normally."
+    },
+  })
+
+  return { create, list, cancel, emit, events, pause, resume }
 }

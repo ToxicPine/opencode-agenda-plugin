@@ -1,5 +1,5 @@
-export { SchedulerPlugin } from "./plugin.js"
-export { EventStore, generateId } from "./event-store.js"
+export { AgendaPlugin } from "./plugin.js"
+export { EventStore, generateId, findMatchingEntries } from "./event-store.js"
 export type {
   StoreEvent,
   StoreEventType,
@@ -12,16 +12,16 @@ export type {
   EmitAction,
   CancelAction,
   ScheduleAction,
-  ScheduleStatus,
-  ScheduleEntry,
+  AgendaStatus,
+  AgendaEntry,
   BusEvent,
 } from "./event-store.js"
 export { createTools } from "./tools.js"
 export {
   DEFAULT_SAFETY,
-  validateSchedule,
+  validateCreate,
   validateBusEmit,
-  shouldFire,
+  pauseViolation,
   type SafetyConfig,
   type SafetyViolation,
 } from "./safety.js"

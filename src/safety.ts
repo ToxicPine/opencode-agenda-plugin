@@ -1,5 +1,5 @@
 /**
- * Safety rails for the scheduler.
+ * Safety rails for the agenda.
  *
  * All limits are project-scoped.
  */
@@ -16,7 +16,6 @@ export interface SafetyConfig {
   minIntervalSeconds: number
   maxPendingPerEventKind: number
   maxBusEmitsPerSessionPerHour: number
-  /** Max cascade depth for action chains within a single tick. */
   maxCascadeDepth: number
   paused: boolean
 }
@@ -41,16 +40,23 @@ export interface SafetyViolation {
 }
 
 // ---------------------------------------------------------------------------
-// Schedule validation
+// Checks
 // ---------------------------------------------------------------------------
 
-export async function validateSchedule(
+/** Returns a violation if the agenda is paused, null otherwise. */
+export const pauseViolation = (config: SafetyConfig): SafetyViolation | null =>
+  config.paused
+    ? { rule: "paused", message: "Agenda is paused." }
+    : null
+
+/** Validate that a new agenda item does not violate safety limits. */
+export const validateCreate = (
   store: EventStore,
   action: Action,
   trigger: Trigger,
   config: SafetyConfig = DEFAULT_SAFETY,
-): Promise<SafetyViolation | null> {
-  const pending = await store.pending()
+): SafetyViolation | null => {
+  const pending = store.pending()
 
   // 1. Project cap
   if (pending.length >= config.maxPendingProject) {
@@ -60,7 +66,7 @@ export async function validateSchedule(
     }
   }
 
-  // 2. Per-session cap (only for command actions)
+  // 2. Per-session cap (command actions only)
   if (action.type === "command") {
     const sessionPending = pending.filter(
       (e) => e.action.type === "command" && e.action.sessionId === action.sessionId,
@@ -84,7 +90,7 @@ export async function validateSchedule(
       if (diff < config.minIntervalSeconds * 1000) {
         return {
           rule: "min_interval",
-          message: `Another schedule is within ${config.minIntervalSeconds}s of this time.`,
+          message: `Another item is within ${config.minIntervalSeconds}s of this time.`,
         }
       }
     }
@@ -106,7 +112,7 @@ export async function validateSchedule(
       if (kindPending.length >= config.maxPendingPerEventKind) {
         return {
           rule: "max_pending_event_kind",
-          message: `Too many pending schedules for event kind "${kind}" (${config.maxPendingPerEventKind}).`,
+          message: `Too many pending items for event kind "${kind}" (${config.maxPendingPerEventKind}).`,
         }
       }
     }
@@ -115,39 +121,24 @@ export async function validateSchedule(
   return null
 }
 
-// ---------------------------------------------------------------------------
-// Bus emit validation
-// ---------------------------------------------------------------------------
-
-export async function validateBusEmit(
+/** Validate that a session hasn't exceeded its bus emit rate limit. */
+export const validateBusEmit = (
   store: EventStore,
   sessionId: string,
   config: SafetyConfig = DEFAULT_SAFETY,
-): Promise<SafetyViolation | null> {
-  const events = await store.readAll()
+): SafetyViolation | null => {
   const hourAgo = Date.now() - 60 * 60 * 1000
-  const recentEmits = events.filter(
-    (e): e is Extract<typeof e, { type: "bus.emitted" }> =>
-      e.type === "bus.emitted" &&
-      e.payload.sessionId === sessionId &&
+  const recentCount = store.busEvents().filter(
+    (e) =>
+      e.sessionId === sessionId &&
       new Date(e.timestamp).getTime() > hourAgo,
-  )
-  if (recentEmits.length >= config.maxBusEmitsPerSessionPerHour) {
+  ).length
+
+  if (recentCount >= config.maxBusEmitsPerSessionPerHour) {
     return {
       rule: "max_bus_emits",
-      message: `Session emitted ${recentEmits.length} events in the last hour (limit ${config.maxBusEmitsPerSessionPerHour}).`,
+      message: `Session emitted ${recentCount} events in the last hour (limit ${config.maxBusEmitsPerSessionPerHour}).`,
     }
-  }
-  return null
-}
-
-// ---------------------------------------------------------------------------
-// Firing check
-// ---------------------------------------------------------------------------
-
-export function shouldFire(config: SafetyConfig): SafetyViolation | null {
-  if (config.paused) {
-    return { rule: "paused", message: "Scheduler is paused." }
   }
   return null
 }

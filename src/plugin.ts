@@ -4,51 +4,60 @@
  * Runs two polling loops (time triggers + event matching/expiry).
  * Executes actions directly: command (LLM), emit/cancel/schedule (no LLM).
  * Cascades within a tick up to maxCascadeDepth.
+ *
+ * A per-tick mutex prevents overlapping poll cycles from processing the
+ * same entry twice. Interval IDs are tracked for defensive cleanup.
  */
 
-import type { Plugin } from "@opencode-ai/plugin"
+import type { Plugin, PluginInput } from "@opencode-ai/plugin"
+import { readFile } from "fs/promises"
+import path from "path"
 import {
   EventStore,
   generateId,
-  type ScheduleEntry,
+  type AgendaEntry,
   type Action,
   type TimeTrigger,
   type EventTrigger,
 } from "./event-store.js"
 import { createTools } from "./tools.js"
-import { DEFAULT_SAFETY, shouldFire, type SafetyConfig } from "./safety.js"
+import { DEFAULT_SAFETY, pauseViolation, type SafetyConfig } from "./safety.js"
 
 const POLL_INTERVAL_MS = 5_000
+
+type Client = PluginInput["client"]
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-async function toast(
-  client: any,
+const toast = async (
+  client: Client,
   title: string,
   message: string,
-  variant: string,
-): Promise<void> {
+  variant: "success" | "info" | "warning" | "error",
+): Promise<void> => {
   try {
     await client.tui.showToast({ body: { title, message, variant } })
-  } catch {}
+  } catch {
+    // TUI may not be available (headless, tests)
+  }
 }
 
 // ---------------------------------------------------------------------------
 // Action executor
 // ---------------------------------------------------------------------------
 
-async function executeAction(
-  client: any,
+const executeAction = async (
+  client: Client,
   store: EventStore,
-  entry: ScheduleEntry,
+  entry: AgendaEntry,
   safetyConfig: SafetyConfig,
   triggeredByEvent: string | undefined,
   depth: number,
   processEmit: (kind: string, depth: number) => Promise<void>,
-): Promise<void> {
-  const action = entry.action
+): Promise<void> => {
+  const { action } = entry
 
   try {
     switch (action.type) {
@@ -56,9 +65,9 @@ async function executeAction(
         let sessionId = action.sessionId
         if (sessionId === "new") {
           const session = await client.session.create({
-            body: { title: `Scheduled: /${action.command} ${action.arguments}`.trim() },
+            body: { title: `Agenda: /${action.command} ${action.arguments}`.trim() },
           })
-          sessionId = session?.data?.id ?? session?.id ?? (session as any)?.data?.id
+          sessionId = (session as any)?.data?.id ?? (session as any)?.id
           if (!sessionId) throw new Error("Failed to create new session")
         }
         await client.session.command({
@@ -66,15 +75,15 @@ async function executeAction(
           body: { command: action.command, arguments: action.arguments },
         })
         await store.append({
-          type: "schedule.executed",
+          type: "agenda.executed",
           payload: {
-            scheduleId: entry.scheduleId,
+            agendaId: entry.agendaId,
             result: "success",
             triggeredByEvent,
             actualSessionId: sessionId,
           },
         })
-        await toast(client, "Command Executed", `/${action.command} ${action.arguments} (${entry.scheduleId})`, "success")
+        await toast(client, "Command Executed", `/${action.command} ${action.arguments} (${entry.agendaId})`, "success")
         break
       }
 
@@ -85,63 +94,61 @@ async function executeAction(
             eventId: generateId("bus"),
             kind: action.kind,
             message: action.message,
-            sessionId: "scheduler",
+            sessionId: "agenda",
           },
         })
         await store.append({
-          type: "schedule.executed",
-          payload: { scheduleId: entry.scheduleId, result: "emitted", triggeredByEvent },
+          type: "agenda.executed",
+          payload: { agendaId: entry.agendaId, result: "emitted", triggeredByEvent },
         })
-        await toast(client, "Event Emitted (scheduled)", `"${action.kind}": ${action.message}`, "info")
-        // Cascade: process the newly emitted event
+        await toast(client, "Event Emitted (agenda)", `"${action.kind}": ${action.message}`, "info")
         await processEmit(action.kind, depth + 1)
         break
       }
 
       case "cancel": {
-        const targets = await store.materialize()
-        const target = targets.find((e) => e.scheduleId === action.scheduleId)
+        const target = store.entries().find((e) => e.agendaId === action.scheduleId)
         if (target && target.status === "pending") {
           await store.append({
-            type: "schedule.cancelled",
-            payload: { scheduleId: action.scheduleId, reason: action.reason },
+            type: "agenda.cancelled",
+            payload: { agendaId: action.scheduleId, reason: action.reason },
           })
-          await toast(client, "Schedule Cancelled (scheduled)", `${action.scheduleId}: ${action.reason}`, "warning")
+          await toast(client, "Agenda Cancelled (cascade)", `${action.scheduleId}: ${action.reason}`, "warning")
         }
         await store.append({
-          type: "schedule.executed",
-          payload: { scheduleId: entry.scheduleId, result: "cancelled-target", triggeredByEvent },
+          type: "agenda.executed",
+          payload: { agendaId: entry.agendaId, result: "cancelled-target", triggeredByEvent },
         })
         break
       }
 
       case "schedule": {
-        const newId = generateId("sch")
+        const newId = generateId("agn")
         await store.append({
-          type: "schedule.created",
+          type: "agenda.created",
           payload: {
-            scheduleId: newId,
+            agendaId: newId,
             trigger: action.trigger,
             action: action.action,
             reason: action.reason,
-            createdBy: "scheduler",
+            createdBy: "agenda",
           },
         })
         await store.append({
-          type: "schedule.executed",
-          payload: { scheduleId: entry.scheduleId, result: `created-${newId}`, triggeredByEvent },
+          type: "agenda.executed",
+          payload: { agendaId: entry.agendaId, result: `created-${newId}`, triggeredByEvent },
         })
-        await toast(client, "Schedule Created (scheduled)", `${newId}: ${action.reason}`, "info")
+        await toast(client, "Agenda Created (cascade)", `${newId}: ${action.reason}`, "info")
         break
       }
     }
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err)
     await store.append({
-      type: "schedule.failed",
-      payload: { scheduleId: entry.scheduleId, error: message, triggeredByEvent },
+      type: "agenda.failed",
+      payload: { agendaId: entry.agendaId, error: message, triggeredByEvent },
     })
-    await toast(client, "Schedule Failed", `${entry.scheduleId}: ${message}`, "error")
+    await toast(client, "Agenda Failed", `${entry.agendaId}: ${message}`, "error")
   }
 }
 
@@ -149,111 +156,139 @@ async function executeAction(
 // Plugin
 // ---------------------------------------------------------------------------
 
-export const SchedulerPlugin: Plugin = async ({ client, directory }) => {
+export const AgendaPlugin: Plugin = async ({ client, directory }) => {
   const store = new EventStore(directory)
   await store.init()
 
   const safetyConfig: SafetyConfig = { ...DEFAULT_SAFETY }
-  const tools = createTools(store, safetyConfig)
+
+  // Restore pause state from config file
+  try {
+    const configPath = path.join(directory, ".opencode", "agenda", "config.json")
+    const raw = await readFile(configPath, "utf-8")
+    const config = JSON.parse(raw)
+    if (typeof config.paused === "boolean") {
+      safetyConfig.paused = config.paused
+    }
+  } catch {
+    // No config file or invalid JSON — use defaults
+  }
+
+  const tools = createTools(store, safetyConfig, directory)
 
   let lastBusTimestamp = new Date().toISOString()
+  let processing = false
 
-  /** Process a newly emitted event kind -- find matching schedules, execute, cascade. */
-  async function processEmit(kind: string, depth: number): Promise<void> {
+  /** Process a newly emitted event kind — find matching entries, execute, cascade. */
+  const processEmit = async (kind: string, depth: number): Promise<void> => {
     if (depth >= safetyConfig.maxCascadeDepth) return
 
-    const matching = await store.matchingSchedules(kind)
+    const matching = store.matchingEntries(kind)
     for (const entry of matching) {
-      // Re-check still pending
-      const current = await store.pending()
-      if (!current.find((e) => e.scheduleId === entry.scheduleId)) continue
+      // Re-check: entry may have been consumed by a prior iteration in this loop
+      const current = store.pending()
+      if (!current.find((e) => e.agendaId === entry.agendaId)) continue
       await executeAction(client, store, entry, safetyConfig, kind, depth, processEmit)
     }
   }
 
-  // Time trigger loop
-  setInterval(async () => {
-    if (shouldFire(safetyConfig)) return
-    const pending = await store.pending("time")
-    const now = Date.now()
-
-    for (const entry of pending) {
-      if (entry.trigger.type !== "time" || new Date(entry.trigger.executeAt).getTime() > now)
-        continue
-      await executeAction(client, store, entry, safetyConfig, undefined, 0, processEmit)
-    }
-  }, POLL_INTERVAL_MS)
-
-  // Event trigger loop (expiry + new bus events)
-  setInterval(async () => {
-    if (shouldFire(safetyConfig)) return
-    const now = Date.now()
-
-    // Expire stale
-    const pendingEvent = await store.pending("event")
-    for (const entry of pendingEvent) {
-      if (
-        entry.trigger.type === "event" &&
-        entry.trigger.expiresAt &&
-        new Date(entry.trigger.expiresAt).getTime() <= now
-      ) {
-        await store.append({
-          type: "schedule.expired",
-          payload: { scheduleId: entry.scheduleId },
-        })
-        await toast(client, "Schedule Expired", entry.scheduleId, "warning")
+  // Time trigger tick
+  const timeTick = async (): Promise<void> => {
+    if (processing || pauseViolation(safetyConfig)) return
+    processing = true
+    try {
+      const pending = store.pending("time")
+      const now = Date.now()
+      for (const entry of pending) {
+        if (entry.trigger.type !== "time") continue
+        if (new Date(entry.trigger.executeAt).getTime() > now) continue
+        await executeAction(client, store, entry, safetyConfig, undefined, 0, processEmit)
       }
+    } finally {
+      processing = false
     }
+  }
 
-    // Process new bus events
-    const allBus = await store.busEvents()
-    const newEvents = allBus.filter((e) => e.timestamp > lastBusTimestamp)
-    if (newEvents.length === 0) return
-    lastBusTimestamp = newEvents[newEvents.length - 1].timestamp
+  // Event trigger tick (expiry + new bus events)
+  const eventTick = async (): Promise<void> => {
+    if (processing || pauseViolation(safetyConfig)) return
+    processing = true
+    try {
+      const now = Date.now()
 
-    for (const busEvt of newEvents) {
-      await processEmit(busEvt.kind, 0)
+      // Expire stale event-triggered entries
+      for (const entry of store.pending("event")) {
+        if (
+          entry.trigger.type === "event" &&
+          entry.trigger.expiresAt &&
+          new Date(entry.trigger.expiresAt).getTime() <= now
+        ) {
+          await store.append({
+            type: "agenda.expired",
+            payload: { agendaId: entry.agendaId },
+          })
+          await toast(client, "Agenda Expired", entry.agendaId, "warning")
+        }
+      }
+
+      // Process new bus events since last tick
+      const allBus = store.busEvents()
+      const newEvents = allBus.filter((e) => e.timestamp > lastBusTimestamp)
+      if (newEvents.length === 0) return
+      lastBusTimestamp = newEvents[newEvents.length - 1].timestamp
+
+      for (const busEvt of newEvents) {
+        await processEmit(busEvt.kind, 0)
+      }
+    } finally {
+      processing = false
     }
-  }, POLL_INTERVAL_MS)
+  }
+
+  // Start polling loops (staggered to avoid simultaneous first tick)
+  const timeInterval = setInterval(timeTick, POLL_INTERVAL_MS)
+  const eventInterval = setInterval(eventTick, POLL_INTERVAL_MS)
 
   // -----------------------------------------------------------------------
   // Plugin hooks
   // -----------------------------------------------------------------------
   return {
     tool: {
-      schedule: tools.schedule,
-      schedule_list: tools.list,
-      schedule_cancel: tools.cancel,
-      bus_emit: tools.busEmit,
-      bus_events: tools.busEvents,
+      agenda_create: tools.create,
+      agenda_list: tools.list,
+      agenda_cancel: tools.cancel,
+      agenda_emit: tools.emit,
+      agenda_events: tools.events,
+      agenda_pause: tools.pause,
+      agenda_resume: tools.resume,
     },
 
     "tool.execute.after": async (input, output) => {
-      if (input.tool === "schedule")
-        await toast(client, "Scheduled", String(output.result).split("\n")[0], "info")
-      if (input.tool === "schedule_cancel")
-        await toast(client, "Cancelled", String(output.result), "warning")
-      if (input.tool === "bus_emit")
-        await toast(client, "Event Emitted", String(output.result).split("\n")[0], "info")
+      if (input.tool === "agenda_create")
+        await toast(client, "Agenda Created", String(output.output).split("\n")[0], "info")
+      if (input.tool === "agenda_cancel")
+        await toast(client, "Agenda Cancelled", String(output.output), "warning")
+      if (input.tool === "agenda_emit")
+        await toast(client, "Event Emitted", String(output.output).split("\n")[0], "info")
     },
 
     "experimental.session.compacting": async (_input, output) => {
-      const pending = await store.pending()
+      const pending = store.pending()
       if (pending.length === 0) return
 
       const timeEntries = pending.filter(
-        (s): s is ScheduleEntry & { trigger: TimeTrigger } => s.trigger.type === "time",
+        (s): s is AgendaEntry & { trigger: TimeTrigger } => s.trigger.type === "time",
       )
       const eventEntries = pending.filter(
-        (s): s is ScheduleEntry & { trigger: EventTrigger } => s.trigger.type === "event",
+        (s): s is AgendaEntry & { trigger: EventTrigger } => s.trigger.type === "event",
       )
 
-      let ctx = `## Active Project Schedule\n\n`
+      let ctx = `## Active Project Agenda\n\n`
       if (timeEntries.length > 0) {
         ctx += `### Time-Triggered (${timeEntries.length})\n`
         ctx += timeEntries.map((s) => {
           const act = s.action.type === "command" ? `/${s.action.command}` : s.action.type
-          return `- [${s.scheduleId}] ${act} at ${s.trigger.executeAt}` + (s.reason ? ` -- ${s.reason}` : "")
+          return `- [${s.agendaId}] ${act} at ${s.trigger.executeAt}` + (s.reason ? ` -- ${s.reason}` : "")
         }).join("\n") + "\n\n"
       }
       if (eventEntries.length > 0) {
@@ -262,7 +297,7 @@ export const SchedulerPlugin: Plugin = async ({ client, directory }) => {
           const act = s.action.type === "command" ? `/${s.action.command}` : s.action.type
           const kinds = Array.isArray(s.trigger.eventKind) ? s.trigger.eventKind : [s.trigger.eventKind]
           const mode = s.trigger.matchMode ?? "any"
-          return `- [${s.scheduleId}] ${act} on ${mode}(${kinds.join(", ")})` + (s.reason ? ` -- ${s.reason}` : "")
+          return `- [${s.agendaId}] ${act} on ${mode}(${kinds.join(", ")})` + (s.reason ? ` -- ${s.reason}` : "")
         }).join("\n") + "\n\n"
       }
       output.context.push(ctx)
@@ -270,9 +305,9 @@ export const SchedulerPlugin: Plugin = async ({ client, directory }) => {
 
     event: async ({ event }) => {
       if (event.type === "session.idle") {
-        const pending = await store.pending()
+        const pending = store.pending()
         if (pending.length > 0)
-          await toast(client, "Pending Schedules", `${pending.length} active in project`, "info")
+          await toast(client, "Pending Agenda", `${pending.length} item(s) active in project`, "info")
       }
     },
   }

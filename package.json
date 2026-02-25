@@ -1,17 +1,35 @@
 {
-  "name": "opencode-scheduler-plugin",
+  "name": "opencode-agenda-plugin",
   "version": "0.1.0",
   "description": "Give OpenCode agents the ability to schedule their own future work -- time-based or event-driven, across sessions, within a project.",
   "type": "module",
-  "main": "src/index.ts",
+  "main": "dist/agenda.js",
+  "types": "dist/agenda.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/agenda.js",
+      "types": "./dist/agenda.d.ts"
+    }
+  },
+  "files": [
+    "dist",
+    "src",
+    "agenda.ts",
+    "commands",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "build": "tsc",
+    "prepublishOnly": "npm run build"
   },
   "dependencies": {
-    "@opencode-ai/plugin": "^1.2.12"
+    "@opencode-ai/plugin": "^1.2.0"
   },
   "devDependencies": {
-    "typescript": "^5.7.0"
+    "typescript": "^5.7.0",
+    "bun-types": "^1.2.0"
   },
   "license": "MIT"
 }
