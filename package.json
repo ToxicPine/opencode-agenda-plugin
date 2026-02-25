@@ -1,5 +1,5 @@
 {
-  "name": "opencode-agenda-plugin",
+  "name": "@toxicpine/opencode-agenda-plugin",
   "version": "0.1.0",
   "description": "Give OpenCode agents the ability to schedule their own future work -- time-based or event-driven, across sessions, within a project.",
   "type": "module",
@@ -10,6 +10,9 @@
       "import": "./dist/agenda.js",
       "types": "./dist/agenda.d.ts"
     }
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "files": [
     "dist",

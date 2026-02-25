@@ -1,4 +1,4 @@
-# opencode-agenda-plugin
+# @toxicpine/opencode-agenda-plugin
 
 An OpenCode plugin that lets agents schedule their own future work. An agent in a conversation can set actions to fire later -- after a delay, or when another agent emits a signal -- enabling autonomous multi-step workflows without a human re-prompting at each stage.
 
@@ -81,7 +81,7 @@ Add the package name to the `plugin` array in your project's `opencode.json`:
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugin": ["opencode-agenda-plugin"]
+  "plugin": ["@toxicpine/opencode-agenda-plugin"]
 }
 ```
 
@@ -94,7 +94,7 @@ Clone this repo somewhere on disk. Add it as a dependency in `.opencode/package.
 ```json
 {
   "dependencies": {
-    "opencode-agenda-plugin": "file:../path/to/opencode-agenda-plugin"
+    "@toxicpine/opencode-agenda-plugin": "file:../path/to/opencode-agenda-plugin"
   }
 }
 ```
