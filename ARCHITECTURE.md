@@ -102,88 +102,94 @@ The only `as` cast in the store is `as StoreEvent` at the `JSON.parse` boundary 
 
 ---
 
-## Poll Loop Lifecycle
+## Poll Loop & Task Queue
 
-Two `setInterval` loops run at 5-second intervals, gated by a shared `processing` mutex.
+A single `setInterval` loop runs every 5 seconds. Each tick follows a three-phase pipeline: **expire → enqueue → drain**.
+
+An idempotent task queue (`Map<agendaId, triggeredByEvent>`) sits between trigger detection and execution. Multiple sources can enqueue the same ID — the second call is a no-op. This eliminates the need for a mutex or any coordination between trigger types.
 
 ```mermaid
 flowchart TD
     Start["Plugin init"] --> Init["EventStore.init()<br/>(replay JSONL → cache)"]
     Init --> RestorePause["Read config.json<br/>→ restore paused state"]
-    RestorePause --> Loops["Start intervals"]
+    RestorePause --> Loop["Start setInterval (5s)"]
 
-    Loops --> TL["⏱ timeTick<br/>(every 5s)"]
-    Loops --> EL["📡 eventTick<br/>(every 5s)"]
+    Loop --> Tick["tick()"]
+    Tick --> Paused{"paused?"}
+    Paused -- yes --> Skip["skip"]
+    Paused -- no --> Phase1
 
-    TL --> MutexT{"processing?"}
-    MutexT -- yes --> SkipT["skip"]
-    MutexT -- no --> PauseT{"paused?"}
-    PauseT -- yes --> SkipT
-    PauseT -- no --> LockT["processing = true"]
-    LockT --> ScanT["Scan pending time triggers<br/>where executeAt ≤ now"]
-    ScanT --> ExecT["executeAction() for each"]
-    ExecT --> UnlockT["processing = false"]
+    subgraph Phase1 ["Phase 1: Expire"]
+        Expire["For each pending event trigger<br/>where expiresAt ≤ now:<br/>append agenda.expired"]
+    end
 
-    EL --> MutexE{"processing?"}
-    MutexE -- yes --> SkipE["skip"]
-    MutexE -- no --> PauseE{"paused?"}
-    PauseE -- yes --> SkipE
-    PauseE -- no --> LockE["processing = true"]
-    LockE --> Expire["Expire stale event triggers<br/>where expiresAt ≤ now"]
-    Expire --> NewBus["Find bus events since<br/>lastBusTimestamp"]
-    NewBus --> ProcessEmit["processEmit() for each<br/>new bus event kind"]
-    ProcessEmit --> UnlockE["processing = false"]
+    Phase1 --> Phase2
+
+    subgraph Phase2 ["Phase 2: Enqueue"]
+        EnqTime["Time triggers where<br/>executeAt ≤ now<br/>→ enqueue(agendaId)"]
+        EnqBus["New bus events since<br/>lastBusTimestamp<br/>→ enqueueMatchingEntries(kind)"]
+    end
+
+    Phase2 --> Phase3
+
+    subgraph Phase3 ["Phase 3: Drain"]
+        DrainLoop{"queue.size > 0<br/>AND depth < maxCascadeDepth?"}
+        DrainLoop -- no --> Done["tick complete"]
+        DrainLoop -- yes --> Batch["Take batch = [...queue]<br/>queue.clear()"]
+        Batch --> ExecLoop["For each agendaId in batch:<br/>skip if not pending,<br/>executeAction()"]
+        ExecLoop --> Cascade["Emit actions return kind →<br/>enqueueMatchingEntries(kind)"]
+        Cascade --> Depth["depth++"]
+        Depth --> DrainLoop
+    end
 ```
 
-The shared `processing` flag ensures that `timeTick` and `eventTick` never overlap, preventing double-execution of the same agenda item.
+**Why a Map, not a Set:** The map value tracks `triggeredByEvent` — the bus event kind that caused the enqueue — which gets recorded in the `agenda.executed` event for audit. The idempotency property comes from the key: if an agendaId is already in the map, `enqueue()` is a no-op.
 
 ---
 
 ## Cascade Execution
 
-When an action emits a bus event, the plugin immediately checks for matching pending event-triggered items and executes them in the same tick — recursively, up to `maxCascadeDepth` (default 8).
+Cascade is what happens when an action's side effect triggers another pending item. Instead of recursive function calls, cascade emerges naturally from the drain loop:
+
+1. `executeAction()` for an emit action returns `["tests.passed"]`
+2. `enqueueMatchingEntries("tests.passed")` adds matching pending items to the queue
+3. The drain loop iterates again, picking up the newly enqueued items
+4. Repeat until the queue is empty or `maxCascadeDepth` (default 8) drain iterations reached
+
+This is **breadth-first** — all items from one wave execute before the next wave's items. No recursive calls, no depth parameter threaded through functions.
 
 ```mermaid
 sequenceDiagram
-    participant Poll as Poll Tick
+    participant Tick as tick()
+    participant Queue as Queue (Map)
+    participant Drain as drain()
     participant Exec as executeAction()
     participant Store as EventStore
-    participant Cascade as processEmit()
 
-    Poll->>Store: pending("time") or new bus events
-    Poll->>Exec: fire matching entry
+    Tick->>Queue: enqueue ready time triggers
+    Tick->>Queue: enqueue bus-event matches
+    Tick->>Drain: drain()
 
-    alt action.type === "emit"
-        Exec->>Store: append bus.emitted
-        Exec->>Store: append agenda.executed
-        Exec->>Cascade: processEmit(kind, depth+1)
-        Cascade->>Store: matchingEntries(kind)
-        loop For each matching entry (if depth < maxCascadeDepth)
-            Cascade->>Store: re-check still pending
-            Cascade->>Exec: executeAction(entry, depth)
-            Note over Exec,Cascade: Recursive: emit actions<br/>cascade further
+    loop depth < maxCascadeDepth AND queue not empty
+        Drain->>Queue: batch = [...queue], queue.clear()
+        loop For each agendaId in batch
+            Drain->>Store: lookup entry, skip if not pending
+            Drain->>Exec: executeAction(entry)
+            Exec->>Store: append events (executed, bus.emitted, etc.)
+            Exec-->>Drain: return emitted kinds []
+
+            alt emitted kinds not empty
+                Drain->>Store: matchingEntries(kind)
+                Drain->>Queue: enqueue matching entries
+            end
         end
-    end
-
-    alt action.type === "cancel"
-        Exec->>Store: append agenda.cancelled (target)
-        Exec->>Store: append agenda.executed (self)
-    end
-
-    alt action.type === "schedule"
-        Exec->>Store: append agenda.created (new item)
-        Exec->>Store: append agenda.executed (self)
-    end
-
-    alt action.type === "command"
-        Exec->>Store: client.session.command()
-        Exec->>Store: append agenda.executed
+        Note over Drain: depth++, loop back to check queue
     end
 ```
 
 **Zero-cost actions** (`emit`, `cancel`, `schedule`) execute directly in the plugin process — no LLM tokens consumed. Only `command` actions invoke slash commands in sessions, which cost tokens.
 
-The re-check (`store.pending()` before executing each match) prevents double-execution when a prior cascade step already consumed an entry.
+The pending guard (`entry.status !== "pending"`) at drain time prevents double-execution — if a cancel action in the same batch already consumed an entry, it's skipped.
 
 ---
 
@@ -204,7 +210,7 @@ flowchart LR
         Hook1["tool.execute.after"]
         Hook2["experimental.session.compacting"]
         Hook3["event handler"]
-        Polls["Poll Loops"]
+        Polls["Poll Loop"]
     end
 
     Loader -->|"loads agenda.ts"| Plugin
@@ -289,7 +295,7 @@ opencode-agenda-plugin/
 ├── README.md                  # Install + usage docs
 ├── ARCHITECTURE.md            # This file
 ├── src/
-│   ├── plugin.ts              # AgendaPlugin: hooks, poll loops, action executor
+│   ├── plugin.ts              # AgendaPlugin: hooks, poll loop, task queue, action executor
 │   ├── event-store.ts         # EventStore class, all domain types, pure functions
 │   ├── safety.ts              # SafetyConfig, validation functions
 │   ├── tools.ts               # createTools() → 7 agenda_* tools
