@@ -47,7 +47,6 @@ Non-command actions run directly in the scheduler. Combined with event triggers,
 - Max 10 pending per session, 30 per project
 - Min 60s between time triggers
 - Max 5 pending per event kind
-- Doom loop: same command blocked after 4 recent failures
 - Bus emission capped at 30 per session per hour
 - Cascade depth capped at 8
 - Global pause via `/schedule-pause`

@@ -14,8 +14,6 @@ export interface SafetyConfig {
   maxPendingPerSession: number
   maxPendingProject: number
   minIntervalSeconds: number
-  doomLoopThreshold: number
-  doomLoopWindowMs: number
   maxPendingPerEventKind: number
   maxBusEmitsPerSessionPerHour: number
   /** Max cascade depth for action chains within a single tick. */
@@ -27,8 +25,6 @@ export const DEFAULT_SAFETY: SafetyConfig = {
   maxPendingPerSession: 10,
   maxPendingProject: 30,
   minIntervalSeconds: 60,
-  doomLoopThreshold: 4,
-  doomLoopWindowMs: 60 * 60 * 1000,
   maxPendingPerEventKind: 5,
   maxBusEmitsPerSessionPerHour: 30,
   maxCascadeDepth: 8,
@@ -112,37 +108,6 @@ export async function validateSchedule(
           rule: "max_pending_event_kind",
           message: `Too many pending schedules for event kind "${kind}" (${config.maxPendingPerEventKind}).`,
         }
-      }
-    }
-  }
-
-  // 5. Doom loop detection (command actions only)
-  if (action.type === "command") {
-    const events = await store.readAll()
-    const windowStart = Date.now() - config.doomLoopWindowMs
-    const recentSchedules = events.filter(
-      (evt): evt is Extract<typeof evt, { type: "schedule.created" }> =>
-        evt.type === "schedule.created" &&
-        new Date(evt.timestamp).getTime() > windowStart &&
-        evt.payload.action.type === "command" &&
-        evt.payload.action.command === action.command &&
-        evt.payload.action.arguments === action.arguments,
-    )
-    const recentExecutions = events.filter(
-      (evt): evt is Extract<typeof evt, { type: "schedule.executed" }> =>
-        evt.type === "schedule.executed" &&
-        new Date(evt.timestamp).getTime() > windowStart,
-    )
-    const executedIds = new Set(
-      recentExecutions.map((e) => e.payload.scheduleId),
-    )
-    const unexecuted = recentSchedules.filter(
-      (e) => !executedIds.has(e.payload.scheduleId),
-    )
-    if (unexecuted.length >= config.doomLoopThreshold) {
-      return {
-        rule: "doom_loop",
-        message: `Doom loop: /${action.command} ${action.arguments} scheduled ${unexecuted.length} times recently without success.`,
       }
     }
   }
