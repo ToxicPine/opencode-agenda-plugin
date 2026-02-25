@@ -1,6 +1,6 @@
 {
   "name": "@toxicpine/opencode-agenda-plugin",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Give OpenCode agents the ability to schedule their own future work -- time-based or event-driven, across sessions, within a project.",
   "type": "module",
   "main": "dist/agenda.js",
@@ -33,6 +33,10 @@
   "devDependencies": {
     "typescript": "^5.7.0",
     "bun-types": "^1.2.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ToxicPine/opencode-agenda-plugin"
   },
   "license": "MIT"
 }
