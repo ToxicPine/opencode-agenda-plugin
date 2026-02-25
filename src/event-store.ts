@@ -1,14 +1,18 @@
 /**
  * Append-only event store backed by a JSONL file.
  *
- * Project-scoped: one event log per project directory. All sessions within
- * the project share the same schedule and event bus.
+ * Project-scoped: one event log per project directory. All sessions
+ * share the same schedule and event bus.
  *
- * Supports two trigger types:
- *   - "time"  : fires when a wall-clock time is reached
- *   - "event" : fires when a matching project event is emitted
+ * Triggers:
+ *   - "time"  : fires at a wall-clock time
+ *   - "event" : fires on matching bus event(s), with any/all convergence
  *
- * Event-triggered schedules can optionally expire.
+ * Actions:
+ *   - "command"  : invoke a slash command in a session
+ *   - "emit"     : emit a bus event (zero LLM cost)
+ *   - "cancel"   : cancel another pending schedule (zero LLM cost)
+ *   - "schedule" : create a new schedule (zero LLM cost)
  */
 
 import { appendFile, readFile, mkdir } from "fs/promises"
@@ -19,24 +23,56 @@ import path from "path"
 // Types -- trigger
 // ---------------------------------------------------------------------------
 
-/** Time-based trigger: fires when wall clock >= executeAt. */
 export interface TimeTrigger {
   type: "time"
-  executeAt: string // ISO 8601
+  executeAt: string
 }
 
-/** Event-based trigger: fires when a project bus event with matching kind
- *  is emitted. Optional expiresAt after which the schedule auto-expires. */
 export interface EventTrigger {
   type: "event"
-  eventKind: string // matched against bus.emitted events
-  expiresAt?: string // ISO 8601, optional
+  /** Single kind or array of kinds. */
+  eventKind: string | string[]
+  /** "any" fires on first match; "all" waits for every kind. Default "any". */
+  matchMode?: "any" | "all"
+  expiresAt?: string
 }
 
 export type Trigger = TimeTrigger | EventTrigger
 
 // ---------------------------------------------------------------------------
-// Types -- store events (discriminated union with typed payloads)
+// Types -- action
+// ---------------------------------------------------------------------------
+
+export interface CommandAction {
+  type: "command"
+  command: string
+  arguments: string
+  sessionId: string
+}
+
+export interface EmitAction {
+  type: "emit"
+  kind: string
+  message: string
+}
+
+export interface CancelAction {
+  type: "cancel"
+  scheduleId: string
+  reason: string
+}
+
+export interface ScheduleAction {
+  type: "schedule"
+  action: Action
+  trigger: Trigger
+  reason: string
+}
+
+export type Action = CommandAction | EmitAction | CancelAction | ScheduleAction
+
+// ---------------------------------------------------------------------------
+// Types -- store events (discriminated union)
 // ---------------------------------------------------------------------------
 
 interface ScheduleCreatedEvent {
@@ -45,10 +81,8 @@ interface ScheduleCreatedEvent {
   timestamp: string
   payload: {
     scheduleId: string
-    sessionId: string
-    command: string
-    arguments: string
     trigger: Trigger
+    action: Action
     reason: string
     createdBy: string
   }
@@ -118,7 +152,6 @@ export type StoreEvent =
 
 export type StoreEventType = StoreEvent["type"]
 
-/** Input type for append(): id and timestamp are generated automatically. */
 export type StoreEventInput =
   | Omit<ScheduleCreatedEvent, "id" | "timestamp">
   | Omit<ScheduleCancelledEvent, "id" | "timestamp">
@@ -140,18 +173,15 @@ export type ScheduleStatus =
 
 export interface ScheduleEntry {
   scheduleId: string
-  /** Session to execute the command in. "new" means create a new session. */
-  sessionId: string
-  command: string
-  arguments: string
   trigger: Trigger
+  action: Action
   status: ScheduleStatus
   reason?: string
   createdAt: string
 }
 
 // ---------------------------------------------------------------------------
-// Types -- project bus event (materialized from bus.emitted)
+// Types -- materialized bus event
 // ---------------------------------------------------------------------------
 
 export interface BusEvent {
@@ -170,6 +200,13 @@ export function generateId(prefix: string): string {
   return `${prefix}_${randomUUID().slice(0, 8)}`
 }
 
+/** Normalize eventKind to always be an array. */
+function normalizeKinds(trigger: EventTrigger): string[] {
+  return Array.isArray(trigger.eventKind)
+    ? trigger.eventKind
+    : [trigger.eventKind]
+}
+
 // ---------------------------------------------------------------------------
 // Event store
 // ---------------------------------------------------------------------------
@@ -186,12 +223,10 @@ export class EventStore {
     )
   }
 
-  /** Ensure the parent directory exists. */
   async init(): Promise<void> {
     await mkdir(path.dirname(this.eventsPath), { recursive: true })
   }
 
-  /** Append a single event to the log. */
   async append(event: StoreEventInput): Promise<StoreEvent> {
     await this.init()
     const full = {
@@ -203,7 +238,6 @@ export class EventStore {
     return full
   }
 
-  /** Read every event from the log. */
   async readAll(): Promise<StoreEvent[]> {
     try {
       const content = await readFile(this.eventsPath, "utf-8")
@@ -218,10 +252,9 @@ export class EventStore {
   }
 
   // -----------------------------------------------------------------------
-  // Materialization -- schedule entries
+  // Materialization -- schedules
   // -----------------------------------------------------------------------
 
-  /** Replay events into the current materialized schedule. */
   async materialize(): Promise<ScheduleEntry[]> {
     const events = await this.readAll()
     const map = new Map<string, ScheduleEntry>()
@@ -231,44 +264,40 @@ export class EventStore {
         case "schedule.created":
           map.set(evt.payload.scheduleId, {
             scheduleId: evt.payload.scheduleId,
-            sessionId: evt.payload.sessionId,
-            command: evt.payload.command,
-            arguments: evt.payload.arguments,
             trigger: evt.payload.trigger,
+            action: evt.payload.action,
             status: "pending",
             reason: evt.payload.reason || undefined,
             createdAt: evt.timestamp,
           })
           break
         case "schedule.cancelled": {
-          const entry = map.get(evt.payload.scheduleId)
-          if (entry) entry.status = "cancelled"
+          const e = map.get(evt.payload.scheduleId)
+          if (e) e.status = "cancelled"
           break
         }
         case "schedule.executed": {
-          const entry = map.get(evt.payload.scheduleId)
-          if (entry) entry.status = "executed"
+          const e = map.get(evt.payload.scheduleId)
+          if (e) e.status = "executed"
           break
         }
         case "schedule.failed": {
-          const entry = map.get(evt.payload.scheduleId)
-          if (entry) entry.status = "failed"
+          const e = map.get(evt.payload.scheduleId)
+          if (e) e.status = "failed"
           break
         }
         case "schedule.expired": {
-          const entry = map.get(evt.payload.scheduleId)
-          if (entry) entry.status = "expired"
+          const e = map.get(evt.payload.scheduleId)
+          if (e) e.status = "expired"
           break
         }
         case "bus.emitted":
-          // Bus events don't affect schedule materialization
           break
       }
     }
     return [...map.values()]
   }
 
-  /** Return entries that are still pending, optionally filtered by trigger type. */
   async pending(byType?: Trigger["type"]): Promise<ScheduleEntry[]> {
     const all = await this.materialize()
     const p = all.filter((e) => e.status === "pending")
@@ -280,13 +309,12 @@ export class EventStore {
   // Materialization -- bus events
   // -----------------------------------------------------------------------
 
-  /** Replay all bus.emitted events into a list. */
   async busEvents(): Promise<BusEvent[]> {
     const events = await this.readAll()
-    const busEvents: BusEvent[] = []
+    const out: BusEvent[] = []
     for (const e of events) {
       if (e.type === "bus.emitted") {
-        busEvents.push({
+        out.push({
           eventId: e.payload.eventId,
           kind: e.payload.kind,
           message: e.payload.message,
@@ -295,14 +323,45 @@ export class EventStore {
         })
       }
     }
-    return busEvents
+    return out
   }
 
-  /** Find pending event-triggered schedules that match a given bus event kind. */
-  async matchingSchedules(kind: string): Promise<ScheduleEntry[]> {
+  // -----------------------------------------------------------------------
+  // Event matching
+  // -----------------------------------------------------------------------
+
+  /**
+   * Find pending event-triggered schedules that should fire given
+   * a newly emitted event kind.
+   *
+   * - "any" mode: fires if the new kind matches any required kind.
+   * - "all" mode: fires only if every required kind has been emitted
+   *   at least once since the schedule was created.
+   */
+  async matchingSchedules(newKind: string): Promise<ScheduleEntry[]> {
     const pending = await this.pending("event")
-    return pending.filter(
-      (e) => e.trigger.type === "event" && e.trigger.eventKind === kind,
-    )
+    const busHistory = await this.busEvents()
+    const matched: ScheduleEntry[] = []
+
+    for (const entry of pending) {
+      if (entry.trigger.type !== "event") continue
+      const kinds = normalizeKinds(entry.trigger)
+      const mode = entry.trigger.matchMode ?? "any"
+
+      if (mode === "any") {
+        if (kinds.includes(newKind)) matched.push(entry)
+      } else {
+        // "all" mode: check that every required kind has a bus event
+        // with timestamp >= schedule createdAt
+        if (!kinds.includes(newKind)) continue
+        const allSatisfied = kinds.every((k) =>
+          busHistory.some(
+            (b) => b.kind === k && b.timestamp >= entry.createdAt,
+          ),
+        )
+        if (allSatisfied) matched.push(entry)
+      }
+    }
+    return matched
   }
 }

@@ -1,64 +1,76 @@
 # opencode-scheduler-plugin
 
-An OpenCode plugin that lets agents schedule their own future work. An agent in a conversation can set slash commands to fire later -- after a delay, or when another agent emits a signal -- enabling autonomous multi-step workflows without a human re-prompting at each stage.
+An OpenCode plugin that lets agents schedule their own future work. An agent in a conversation can set actions to fire later -- after a delay, or when another agent emits a signal -- enabling autonomous multi-step workflows without a human re-prompting at each stage.
 
-Everything is **project-scoped**: one shared schedule and event bus across all sessions in the project. Agents can dispatch work to existing sessions, or spin up new ones.
+Everything is **project-scoped**: one shared schedule and event bus across all sessions. Agents can dispatch work to existing sessions, or spin up new ones.
 
 ## What it enables
 
-- **Self-directed iteration**: an agent breaks a task into steps, does the first, and schedules a command to continue later with fresh context.
-- **Event-driven pipelines**: one agent emits "tests.passed"; a deploy command, waiting on that event, fires immediately in another session.
-- **Parallel delegation**: schedule several commands into new sessions to run concurrently, with a checkpoint command that verifies everything landed.
-- **Autonomous supervision**: schedule a future audit that checks progress and cancels remaining work if the task is stuck.
+- **Self-directed iteration**: an agent works a step, then schedules a command to continue later with fresh context.
+- **Event-driven pipelines**: one agent emits "tests.passed"; a deploy command, waiting on that event, fires immediately.
+- **Convergence**: a schedule waits for *all* of ["auth.done", "users.done", "gateway.done"] before firing integration tests.
+- **Zero-cost trigger chains**: a timeout fires an emit, which cancels a rollback schedule -- no LLM invocations in the chain.
+- **Parallel delegation**: schedule commands into new sessions, converge with an `all`-mode event trigger.
+- **Sagas and rollbacks**: schedule compensating actions on failure events, cancel them on success.
 
-All state is recorded in an append-only event log (`.opencode/scheduler/events.jsonl`). The current schedule is always derivable by replaying the log. Nothing is mutated or deleted.
+All state lives in an append-only event log (`.opencode/scheduler/events.jsonl`). The schedule is always derivable by replaying the log.
 
-## Tools exposed to the model
+## Tools
 
 | Tool | What it does |
 |---|---|
-| `schedule` | Create a time-triggered or event-triggered schedule targeting any session (or `"new"`) |
-| `schedule_list` | List schedules across the project, filterable by status, trigger type, or session |
-| `schedule_cancel` | Cancel a pending schedule (to reschedule: cancel + create a new one) |
-| `bus_emit` | Emit a named event on the project bus -- fires any matching event-triggered schedules |
-| `bus_events` | List recent bus events across sessions |
+| `schedule` | Create a trigger+action pair |
+| `schedule_list` | List schedules, filterable by status, trigger type, action type |
+| `schedule_cancel` | Cancel a pending schedule |
+| `bus_emit` | Emit a named event on the project bus |
+| `bus_events` | List recent bus events |
 
 ## Triggers
 
-**Time**: fires when wall-clock time passes a given ISO 8601 timestamp.
+**Time**: fires at a wall-clock ISO 8601 timestamp.
 
-**Event**: fires when any session in the project emits a bus event with a matching `kind` string. Supports an optional `expiresAt` so the schedule auto-expires if the event never arrives.
+**Event**: fires on a bus event kind. Supports `any` (fire on first match) or `all` (wait for every listed kind). Optional `expiresAt` for auto-expiry.
+
+## Actions
+
+| Action | Effect | LLM cost |
+|---|---|---|
+| `command` | Invoke a slash command in a session (or create a new one) | Yes |
+| `emit` | Emit a bus event | Zero |
+| `cancel` | Cancel another pending schedule | Zero |
+| `schedule` | Create a new schedule | Zero |
+
+Non-command actions run directly in the scheduler. Combined with event triggers, this enables arbitrarily complex trigger chains at zero token cost, with a cascade depth cap (default 8) preventing runaway chains.
 
 ## Safety rails
 
-Hard limits enforced at schedule-creation time:
-
 - Max 10 pending per session, 30 per project
-- Min 60s between any two time-triggered schedules
-- Max 5 pending schedules per event kind
-- Doom loop detection: blocks if the same command has been scheduled 4+ times in the last hour without executing
+- Min 60s between time triggers
+- Max 5 pending per event kind
+- Doom loop: same command blocked after 4 recent failures
 - Bus emission capped at 30 per session per hour
+- Cascade depth capped at 8
 - Global pause via `/schedule-pause`
 
 ## User-facing commands
 
-Copy the `commands/` directory into your project's `.opencode/commands/`:
+Copy `commands/` into `.opencode/commands/`:
 
-- `/schedule` -- show all schedules and recent bus events
+- `/schedule` -- show all schedules and recent events
 - `/schedule-clear` -- cancel everything pending
 - `/schedule-pause` -- stop the scheduler from firing
 
 ## Notifications
 
-The plugin toasts the user on every lifecycle event: scheduled, cancelled, executed, failed, expired, and event emitted. When a session goes idle with pending schedules, it notifies. Schedule context is injected into compaction prompts so the model retains awareness across context resets.
+Toasts on every lifecycle event: scheduled, cancelled, executed, failed, expired, emitted. Schedule context injected into compaction prompts so the model retains awareness across context resets.
 
 ## Teaching agents to use it
 
-The companion **[opencode-scheduler-skill](https://github.com/ToxicPine/opencode-scheduler-skill)** is a Claude skill that teaches agents how to self-orchestrate effectively using this plugin -- including how to create custom commands as schedule targets, structure task files for cross-context persistence, and apply patterns like iterative loops, event-driven pipelines, and self-supervision.
+The companion **[opencode-scheduler-skill](https://github.com/ToxicPine/opencode-scheduler-skill)** teaches agents how to self-orchestrate effectively -- creating commands, structuring task files, and applying patterns like Ralph Loops, event pipelines, convergence, sagas, and evaluator-optimizer loops.
 
 ## Install
 
-Add to your project's `.opencode/package.json` dependencies and reference `SchedulerPlugin` in your plugin config, or copy the `src/` files directly into `.opencode/plugins/`.
+Add to `.opencode/package.json` and reference `SchedulerPlugin` in plugin config, or copy `src/` into `.opencode/plugins/`.
 
 ## License
 
