@@ -42,6 +42,14 @@ export interface CommandAction {
   sessionId: string
 }
 
+export interface SubtaskAction {
+  type: "subtask"
+  prompt: string
+  description: string
+  agent: string
+  sessionId: string
+}
+
 export interface EmitAction {
   type: "emit"
   kind: string
@@ -61,7 +69,7 @@ export interface ScheduleAction {
   reason: string
 }
 
-export type Action = CommandAction | EmitAction | CancelAction | ScheduleAction
+export type Action = CommandAction | SubtaskAction | EmitAction | CancelAction | ScheduleAction
 
 // ---------------------------------------------------------------------------
 // Types -- store events (discriminated union)

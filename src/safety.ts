@@ -66,10 +66,12 @@ export const validateCreate = (
     }
   }
 
-  // 2. Per-session cap (command actions only)
-  if (action.type === "command") {
+  // 2. Per-session cap (command and subtask actions)
+  if (action.type === "command" || action.type === "subtask") {
     const sessionPending = pending.filter(
-      (e) => e.action.type === "command" && e.action.sessionId === action.sessionId,
+      (e) =>
+        (e.action.type === "command" || e.action.type === "subtask") &&
+        e.action.sessionId === action.sessionId,
     )
     if (sessionPending.length >= config.maxPendingPerSession) {
       return {

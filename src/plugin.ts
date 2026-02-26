@@ -21,6 +21,7 @@ import path from "path"
 import {
   EventStore,
   generateId,
+  type Action,
   type AgendaEntry,
   type TimeTrigger,
   type EventTrigger,
@@ -49,6 +50,39 @@ const toast = async (
   }
 }
 
+/** Short label for an action, used in compaction context and list display. */
+const actionLabel = (action: Action): string => {
+  switch (action.type) {
+    case "command": return `/${action.command}`
+    case "subtask": return `subtask: ${action.description}`
+    case "emit": return `emit "${action.kind}"`
+    case "cancel": return `cancel ${action.scheduleId}`
+    case "schedule": return `schedule (nested)`
+  }
+}
+
+/**
+ * Create a new session and return its ID.
+ * The SDK returns { data, error } by default (ThrowOnError = false).
+ */
+const createSession = async (
+  client: Client,
+  title: string,
+  parentId?: string,
+): Promise<string> => {
+  const result = await client.session.create({
+    body: { title, ...(parentId ? { parentID: parentId } : {}) },
+  })
+  const id = result.data?.id
+  if (!id) {
+    const msg = result.error
+      ? `${(result.error as any).message ?? JSON.stringify(result.error)}`
+      : "No session ID in response"
+    throw new Error(`Failed to create session: ${msg}`)
+  }
+  return id
+}
+
 // ---------------------------------------------------------------------------
 // Action executor
 // ---------------------------------------------------------------------------
@@ -68,16 +102,19 @@ const executeAction = async (
       case "command": {
         let sessionId = action.sessionId
         if (sessionId === "new") {
-          const session = await client.session.create({
-            body: { title: `Agenda: /${action.command} ${action.arguments}`.trim() },
-          })
-          sessionId = (session as any)?.data?.id ?? (session as any)?.id
-          if (!sessionId) throw new Error("Failed to create new session")
+          sessionId = await createSession(
+            client,
+            `Agenda: /${action.command} ${action.arguments}`.trim(),
+          )
         }
-        await client.session.command({
+        const result = await client.session.command({
           path: { id: sessionId },
           body: { command: action.command, arguments: action.arguments },
         })
+        if (result.error) {
+          const msg = (result.error as any).message ?? JSON.stringify(result.error)
+          throw new Error(`/${action.command} failed: ${msg}`)
+        }
         await store.append({
           type: "agenda.executed",
           payload: {
@@ -88,6 +125,42 @@ const executeAction = async (
           },
         })
         await toast(client, "Command Executed", `/${action.command} ${action.arguments} (${entry.agendaId})`, "success")
+        break
+      }
+
+      case "subtask": {
+        let sessionId = action.sessionId
+        if (sessionId === "new") {
+          sessionId = await createSession(
+            client,
+            `Subtask: ${action.description}`,
+          )
+        }
+        const result = await client.session.promptAsync({
+          path: { id: sessionId },
+          body: {
+            parts: [{
+              type: "subtask" as const,
+              prompt: action.prompt,
+              description: action.description,
+              agent: action.agent,
+            }],
+          },
+        })
+        if (result.error) {
+          const msg = (result.error as any).message ?? JSON.stringify(result.error)
+          throw new Error(`subtask failed: ${msg}`)
+        }
+        await store.append({
+          type: "agenda.executed",
+          payload: {
+            agendaId: entry.agendaId,
+            result: "dispatched",
+            triggeredByEvent,
+            actualSessionId: sessionId,
+          },
+        })
+        await toast(client, "Subtask Dispatched", `${action.description} (${entry.agendaId})`, "success")
         break
       }
 
@@ -316,14 +389,14 @@ export const AgendaPlugin: Plugin = async ({ client, directory }) => {
       if (timeEntries.length > 0) {
         ctx += `### Time-Triggered (${timeEntries.length})\n`
         ctx += timeEntries.map((s) => {
-          const act = s.action.type === "command" ? `/${s.action.command}` : s.action.type
+          const act = actionLabel(s.action)
           return `- [${s.agendaId}] ${act} at ${s.trigger.executeAt}` + (s.reason ? ` -- ${s.reason}` : "")
         }).join("\n") + "\n\n"
       }
       if (eventEntries.length > 0) {
         ctx += `### Event-Triggered (${eventEntries.length})\n`
         ctx += eventEntries.map((s) => {
-          const act = s.action.type === "command" ? `/${s.action.command}` : s.action.type
+          const act = actionLabel(s.action)
           const kinds = Array.isArray(s.trigger.eventKind) ? s.trigger.eventKind : [s.trigger.eventKind]
           const mode = s.trigger.matchMode ?? "any"
           return `- [${s.agendaId}] ${act} on ${mode}(${kinds.join(", ")})` + (s.reason ? ` -- ${s.reason}` : "")

@@ -35,14 +35,17 @@ All state lives in an append-only event log (`.opencode/agenda/events.jsonl`). T
 
 ## Actions
 
-| Action | Effect | LLM cost |
-|---|---|---|
-| `command` | Invoke a slash command in a session (or create a new one) | Yes |
-| `emit` | Emit a bus event | Zero |
-| `cancel` | Cancel another pending item | Zero |
-| `schedule` | Create a new agenda item | Zero |
+| Action | Effect | LLM cost | Blocking? |
+|---|---|---|---|
+| `command` | Invoke a slash command in a session (or create a new one) | Yes | Yes (sync) |
+| `subtask` | Spawn an async child session via `promptAsync` with `SubtaskPartInput` | Yes | No (fire-and-forget) |
+| `emit` | Emit a bus event | Zero | No |
+| `cancel` | Cancel another pending item | Zero | No |
+| `schedule` | Create a new agenda item | Zero | No |
 
-Non-command actions run directly in the plugin. Combined with event triggers, this enables arbitrarily complex trigger chains at zero token cost, with a cascade depth cap (default 8) preventing runaway chains.
+`command` blocks the poll loop until the LLM responds. `subtask` dispatches immediately and returns — the session runs in the background. Both check the SDK's `{ data, error }` response and record `agenda.failed` on errors.
+
+Zero-cost actions (`emit`, `cancel`, `schedule`) run directly in the plugin. Combined with event triggers, this enables arbitrarily complex trigger chains at zero token cost, with a cascade depth cap (default 8) preventing runaway chains.
 
 ## Safety rails
 

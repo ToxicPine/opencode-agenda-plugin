@@ -9,6 +9,7 @@ export type {
   EventTrigger,
   Action,
   CommandAction,
+  SubtaskAction,
   EmitAction,
   CancelAction,
   ScheduleAction,

@@ -35,6 +35,7 @@ export function createTools(store: EventStore, safetyConfig: SafetyConfig, proje
       "Create an agenda item: a trigger paired with an action. " +
       "Triggers: 'time' (wall-clock) or 'event' (bus event, with any/all convergence). " +
       "Actions: 'command' (invoke a slash command in a session), " +
+      "'subtask' (spawn an async child session via promptAsync, non-blocking), " +
       "'emit' (emit a bus event, zero LLM cost), " +
       "'cancel' (cancel another agenda item, zero LLM cost), " +
       "'schedule' (create a new agenda item, zero LLM cost).",
@@ -63,7 +64,7 @@ export function createTools(store: EventStore, safetyConfig: SafetyConfig, proje
         .optional()
         .describe("ISO 8601 expiry for event triggers (optional)"),
       actionType: tool.schema
-        .enum(["command", "emit", "cancel", "schedule"])
+        .enum(["command", "subtask", "emit", "cancel", "schedule"])
         .describe("Action type to execute when trigger fires"),
       command: tool.schema
         .string()
@@ -76,7 +77,19 @@ export function createTools(store: EventStore, safetyConfig: SafetyConfig, proje
       targetSession: tool.schema
         .string()
         .optional()
-        .describe("Session ID, or 'new' (for actionType='command'). Omit for current session."),
+        .describe("Session ID, or 'new' (for actionType='command' or 'subtask'). Omit for current session."),
+      subtaskPrompt: tool.schema
+        .string()
+        .optional()
+        .describe("The prompt/instructions for the subtask (for actionType='subtask')"),
+      subtaskDescription: tool.schema
+        .string()
+        .optional()
+        .describe("Short description shown in the UI (for actionType='subtask')"),
+      subtaskAgent: tool.schema
+        .string()
+        .optional()
+        .describe("Agent to handle the subtask, e.g. 'coder' (for actionType='subtask')"),
       emitKind: tool.schema
         .string()
         .optional()
@@ -140,6 +153,17 @@ export function createTools(store: EventStore, safetyConfig: SafetyConfig, proje
             sessionId: args.targetSession ?? context.sessionID,
           }
           break
+        case "subtask":
+          if (!args.subtaskPrompt || !args.subtaskDescription)
+            return "ERROR: subtaskPrompt and subtaskDescription required for subtask action."
+          action = {
+            type: "subtask",
+            prompt: args.subtaskPrompt,
+            description: args.subtaskDescription,
+            agent: args.subtaskAgent ?? "coder",
+            sessionId: args.targetSession ?? "new",
+          }
+          break
         case "emit":
           if (!args.emitKind || !args.emitMessage)
             return "ERROR: emitKind and emitMessage required for emit action."
@@ -186,15 +210,28 @@ export function createTools(store: EventStore, safetyConfig: SafetyConfig, proje
         },
       })
 
-      const actionLabel =
-        action.type === "command"
-          ? `/${action.command} ${action.arguments}`.trimEnd() +
-            ` in ${action.sessionId === "new" ? "[new session]" : action.sessionId}`
-          : action.type === "emit"
-            ? `emit "${action.kind}"`
-            : action.type === "cancel"
-              ? `cancel ${action.scheduleId}`
-              : `schedule (nested)`
+      const sessionLabel = (id: string) =>
+        id === "new" ? "[new session]" : id
+
+      let actionDesc: string
+      switch (action.type) {
+        case "command":
+          actionDesc = `/${action.command} ${action.arguments}`.trimEnd() +
+            ` in ${sessionLabel(action.sessionId)}`
+          break
+        case "subtask":
+          actionDesc = `subtask "${action.description}" (${action.agent}) in ${sessionLabel(action.sessionId)}`
+          break
+        case "emit":
+          actionDesc = `emit "${action.kind}"`
+          break
+        case "cancel":
+          actionDesc = `cancel ${action.scheduleId}`
+          break
+        case "schedule":
+          actionDesc = `schedule (nested)`
+          break
+      }
 
       let triggerLabel: string
       if (trigger.type === "time") {
@@ -211,7 +248,7 @@ export function createTools(store: EventStore, safetyConfig: SafetyConfig, proje
           (trigger.expiresAt ? ` expires ${trigger.expiresAt}` : "")
       }
 
-      return `Created: ${actionLabel} ${triggerLabel}\nAgenda ID: ${agendaId}`
+      return `Created: ${actionDesc} ${triggerLabel}\nAgenda ID: ${agendaId}`
     },
   })
 
@@ -226,7 +263,7 @@ export function createTools(store: EventStore, safetyConfig: SafetyConfig, proje
       triggerTypeFilter: tool.schema.string().optional()
         .describe("Filter: time, event"),
       actionTypeFilter: tool.schema.string().optional()
-        .describe("Filter: command, emit, cancel, schedule"),
+        .describe("Filter: command, subtask, emit, cancel, schedule"),
     },
     async execute(args) {
       let entries = store.entries()
@@ -255,11 +292,18 @@ export function createTools(store: EventStore, safetyConfig: SafetyConfig, proje
             if (e.trigger.expiresAt) trig += ` exp:${e.trigger.expiresAt}`
           }
 
+          const sessLabel = (id: string) =>
+            id === "new" ? "new" : id.slice(0, 8)
+
           let act: string
           switch (e.action.type) {
             case "command":
               act = `/${e.action.command} ${e.action.arguments}`.trimEnd() +
-                ` sess:${e.action.sessionId === "new" ? "new" : e.action.sessionId.slice(0, 8)}`
+                ` sess:${sessLabel(e.action.sessionId)}`
+              break
+            case "subtask":
+              act = `subtask "${e.action.description}" (${e.action.agent})` +
+                ` sess:${sessLabel(e.action.sessionId)}`
               break
             case "emit": act = `emit "${e.action.kind}"`; break
             case "cancel": act = `cancel ${e.action.scheduleId}`; break

@@ -47,6 +47,7 @@ graph TD
 
     subgraph Action ["Action (discriminated on type)"]
         CA["CommandAction<br/>type: 'command'<br/>command, arguments, sessionId"]
+        STA["SubtaskAction<br/>type: 'subtask'<br/>prompt, description, agent, sessionId"]
         EA["EmitAction<br/>type: 'emit'<br/>kind, message"]
         XA["CancelAction<br/>type: 'cancel'<br/>scheduleId, reason"]
         SA["ScheduleAction<br/>type: 'schedule'<br/>action: Action, trigger: Trigger, reason"]
@@ -63,6 +64,8 @@ graph TD
 ```
 
 `ScheduleAction` is recursive: it embeds both `Action` and `Trigger`, enabling cascading schedule creation without LLM involvement.
+
+`CommandAction` calls `session.command()` (synchronous — blocks the poll loop). `SubtaskAction` calls `session.promptAsync()` with a `SubtaskPartInput` part (fire-and-forget — returns immediately). Both check the SDK's `{ data, error }` response and record `agenda.failed` on errors.
 
 ---
 
@@ -187,7 +190,7 @@ sequenceDiagram
     end
 ```
 
-**Zero-cost actions** (`emit`, `cancel`, `schedule`) execute directly in the plugin process — no LLM tokens consumed. Only `command` actions invoke slash commands in sessions, which cost tokens.
+**Zero-cost actions** (`emit`, `cancel`, `schedule`) execute directly in the plugin process — no LLM tokens consumed. `command` blocks the poll loop for the full LLM response. `subtask` dispatches via `promptAsync` and returns immediately — the session runs in the background without blocking the tick.
 
 The pending guard (`entry.status !== "pending"`) at drain time prevents double-execution — if a cancel action in the same batch already consumed an entry, it's skipped.
 
